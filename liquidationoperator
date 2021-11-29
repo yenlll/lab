@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: AFL-3.0
+pragma solidity ^0.8;
+
+import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Callee.sol';
+import '@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router01.sol';
+import "hardhat/console.sol";
+
+//
+interface ILendingPool {
+    /**
+     * Function to liquidate a non-healthy position collateral-wise, with Health Factor below 1
+     * - The caller (liquidator) covers `debtToCover` amount of debt of the user getting liquidated, and receives
+     *   a proportionally amount of the `collateralAsset` plus a bonus to cover market risk
+     * @param collateralAsset The address of the underlying asset used as collateral, to receive as result of theliquidation
+     * @param debtAsset The address of the underlying borrowed asset to be repaid with the liquidation
+     * @param user The address of the borrower getting liquidated
+     * @param debtToCover The debt amount of borrowed `asset` the liquidator wants to cover
+     * @param receiveAToken `true` if the liquidators wants to receive the collateral aTokens, `false` if he wants
+     * to receive the underlying collateral asset directly
+     **/
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
+
+    /**
+     * Returns the user account data across all the reserves
+     * @param user The address of the user
+     * @return totalCollateralETH the total collateral in ETH of the user
+     * @return totalDebtETH the total debt in ETH of the user
+     * @return availableBorrowsETH the borrowing power left of the user
+     * @return currentLiquidationThreshold the liquidation threshold of the user
+     * @return ltv the loan to value of the user
+     * @return healthFactor the current health factor of the user
+     **/
+    function getUserAccountData(address user)
+        external
+        view
+        returns (
+            uint256 totalCollateralETH,
+            uint256 totalDebtETH,
+            uint256 availableBorrowsETH,
+            uint256 currentLiquidationThreshold,
+            uint256 ltv,
+            uint256 healthFactor
+        );
+}
+
+// UniswapV2
+
+// https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IERC20.sol
+// https://docs.uniswap.org/protocol/V2/reference/smart-contracts/Pair-ERC-20
+interface IERC20 {
+    // Returns the account balance of another account with address _owner.
+    function balanceOf(address owner) external view returns (uint256);
+
+    /**
+     * Allows _spender to withdraw from your account multiple times, up to the _value amount.
+     * If this function is called again it overwrites the current allowance with _value.
+     * Lets msg.sender set their allowance for a spender.
+     **/
+    function approve(address spender, uint256 value) external; // return type is deleted to be compatible with USDT
+
+    /**
+     * Transfers _value amount of tokens to address _to, and MUST fire the Transfer event.
+     * The function SHOULD throw if the message caller’s account balance does not have enough tokens to spend.
+     * Lets msg.sender send pool tokens to an address.
+     **/
+    function transfer(address to, uint256 value) external returns (bool);
+}
+
+// https://github.com/Uniswap/v2-periphery/blob/master/contracts/interfaces/IWETH.sol
+interface IWETH is IERC20 {
+    // Convert the wrapped token back to Ether.
+    function withdraw(uint256) external;
+}
+
+// https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IUniswapV2Callee.sol
+// The flash loan liquidator we plan to implement this time should be a UniswapV2 Callee
+
+
+// https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IUniswapV2Factory.sol
+// https://docs.uniswap.org/protocol/V2/reference/smart-contracts/factory
+interface IUniswapV2Factory {
+    // Returns the address of the pair for tokenA and tokenB, if it has been created, else address(0).
+    function getPair(address tokenA, address tokenB)
+        external
+        view
+        returns (address pair);
+}
+interface IUniswapV2Router {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+}
+// https://github.com/Uniswap/v2-core/blob/master/contracts/interfaces/IUniswapV2Pair.sol
+// https://docs.uniswap.org/protocol/V2/reference/smart-contracts/pair
+interface IUniswapV2Pair {
+    /**
+     * Swaps tokens. For regular swaps, data.length must be 0.
+     * Also see [Flash Swaps](https://docs.uniswap.org/protocol/V2/concepts/core-concepts/flash-swaps).
+     **/
+    function swap(
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address to,
+        bytes calldata data
+    ) external;
+
+    /**
+     * Returns the reserves of token0 and token1 used to price trades and distribute liquidity.
+     * See Pricing[https://docs.uniswap.org/protocol/V2/concepts/advanced-topics/pricing].
+     * Also returns the block.timestamp (mod 2**32) of the last block during which an interaction occured for the pair.
+     **/
+    function getReserves()
+        external
+        view
+        returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast
+        );
+}
+
+
+
+
+contract LiquidationOperator is IUniswapV2Callee{
+    uint8 public constant health_factor_decimals = 18;
+  // Uniswap V2 router
+  // 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+  constructor() payable {
+    owner = payable(msg.sender);
+    }
+  address private factory = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f; //uniswap V2 factory
+  address private router = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D; //uniswap V2 router
+  address private lendingPool = 0x987115C38Fd9Fd2aA2c6F1718451D167c13a3186; // aave V2 lending pool
+  address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2; //intermediary asset
+  address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+  address private constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+  address payable owner ;
+  address targetAddress = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;
+  //set to the maximum available liquidate amount using type.max(T)
+  
+ 
+
+  event Log(string message, uint val);
+  receive() external payable {}
+  fallback() external payable {}
+  
+  function swap (address _tokenIn, address _tokenOut, uint _amountIn, uint _amountOutMin, address _to) payable external {
+      IERC20(_tokenIn).transfer(address(this), _amountIn);
+        IERC20(_tokenIn).approve(router, _amountIn);
+
+    address[] memory path;
+    if (_tokenIn == WETH || _tokenOut == WETH) {
+      path = new address[](2);
+      path[0] = _tokenIn;
+      path[1] = _tokenOut;
+    } else {
+      path = new address[](3);
+      path[0] = _tokenIn;
+      path[1] = WETH;
+      path[2] = _tokenOut;
+    }
+
+    IUniswapV2Router(router).swapExactTokensForTokens(
+      _amountIn,
+      _amountOutMin,
+      path,
+      _to,
+      block.timestamp
+    );
+  }
+  
+  
+// called by owner
+  function testFlashSwap (address _tokenBorrow, uint _amount) payable external {
+    address pair = IUniswapV2Factory(factory).getPair(USDT,WBTC);
+    require(pair != address(0), "!pair");
+
+    
+    uint amount0Out = _tokenBorrow == USDT ? _amount : 0;
+    uint amount1Out = _tokenBorrow == WBTC ? _amount : 0;
+
+    // need to pass some data to trigger uniswapV2Call
+    bytes memory data = abi.encode(_tokenBorrow, _amount);
+
+    IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), data);
+  }
+  
+
+  // called by pair contract
+  function uniswapV2Call(
+    address _sender,
+    uint _amount0,
+    uint _amount1,
+    bytes calldata _data
+  ) external override {
+    address pair = IUniswapV2Factory(factory).getPair(USDT, WBTC);
+    require(msg.sender == pair, "!pair");
+    require(_sender == address(this), "!sender");
+
+    (address tokenBorrow, uint amount) = abi.decode(_data, (address, uint));
+
+    // about 0.3%
+    uint fee = ((amount * 3) / 997) + 1;
+    uint amountToRepay = amount + fee;
+
+    // do stuff here
+    emit Log("amount", amount);
+    emit Log("amount0", _amount0);
+    emit Log("amount1", _amount1);
+    emit Log("fee", fee);
+    emit Log("amount to repay", amountToRepay);
+
+    IERC20(tokenBorrow).transfer(pair, amountToRepay);
+  }
+  
+ function returnLiquidateAmount(address user) external view returns (uint amount){
+     (,uint liquidateAmount,,,,) = ILendingPool(lendingPool).getUserAccountData(user);
+     return liquidateAmount;
+ }
+  function liquidationFunction(address collateralToken, address debtToken,address user) payable external{
+      (,uint liquidateAmount,,,,uint256 healthFactor) = ILendingPool(lendingPool).getUserAccountData(user);
+      IERC20(debtToken).approve(lendingPool, liquidateAmount);
+       require(healthFactor < 1,"This account is not liquidatable!");
+        ILendingPool(lendingPool).liquidationCall(collateralToken,debtToken,user,liquidateAmount,false);
+
+  }
+  // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
+  function operate() payable external{
+    this.testFlashSwap(USDT,this.returnLiquidateAmount(targetAddress));
+    this.liquidationFunction(USDT,WBTC,targetAddress);
+    this.swap(WBTC,USDT,address(owner).balance,1,owner);
+  }
+}
